@@ -398,7 +398,7 @@ function searchTool(dir: string): ToolDefinition {
         },
       },
       render: (_args, value) => {
-        const v = value as { note?: string; hits?: Array<{ id?: string; level?: string; content?: string; keywords?: unknown; project?: string | null; updated_at?: number | null }> }
+        const v = value as { note?: string; hits?: Array<{ id?: string; level?: string; content?: string; keywords?: unknown; project?: string | null; score?: number; updated_at?: number | null; explain?: { bm25?: number; importance?: number; recencyWeight?: number; status?: string } }> }
         const lines = [String(v.note ?? '')]
         for (const h of v.hits ?? []) {
           // 检索元数据视图：归属 + id + 相对时间 + 关键词（无关键词回退原文开头）；原文内容不显示。
@@ -408,6 +408,12 @@ function searchTool(dir: string): ToolDefinition {
           const proj = `${projectLabel(h.project)} : ${String(h.level ?? '')}`
           const rel = relativeTime(h.updated_at ?? null)
           lines.push(`[${proj}] [${String(h.id ?? '')}] [${rel}] 关于：${about}`)
+          // 可解释检索（#79）：explain=true 时命中行下追加分项得分，文本调用方也能看到 #51 的分解。
+          // 数值已在 search()/execute() 里取过精度，这里原样输出，不再二次舍入。
+          if (h.explain) {
+            const e = h.explain
+            lines.push(`  bm25=${e.bm25 ?? 0} importance=${e.importance ?? 0} recencyWeight=${e.recencyWeight ?? 1} status=${e.status ?? ''} score=${h.score ?? 0}`)
+          }
         }
         return lines.map((t) => ({ type: 'text' as const, text: t }))
       },

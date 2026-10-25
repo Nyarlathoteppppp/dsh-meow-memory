@@ -1247,6 +1247,16 @@ check('search status=archived single filter (#68)', sArch.hits.length >= 1 && sA
     JSON.stringify({ bm25: hitE.explain.bm25, rw: hitE.explain.recencyWeight, score: hitE.score }))
   const noE = await searchTool.execute({ query: '解释检索测试' }, execE)
   check('search default: no explain field (#51)', noE.hits[0] !== undefined && noE.hits[0].explain === undefined)
+  // #79：explain 分项要出现在渲染文本里（模型只读文本），默认输出不变
+  const withText = searchTool.output.render({}, withE).map((x) => x.text)
+  const hitLine = withText.findIndex((t) => t.includes(`[${hitE.id}]`))
+  const eE = hitE.explain
+  check('search render shows explain breakdown under the hit (#79)', hitLine > 0 &&
+    withText[hitLine + 1] === `  bm25=${eE.bm25} importance=${eE.importance} recencyWeight=${eE.recencyWeight} status=${eE.status} score=${hitE.score}`, JSON.stringify(withText))
+  // 小分值不能被渲染舍成 0（bm25/recencyWeight 是 3 位小数）
+  const tiny = searchTool.output.render({}, { note: '', hits: [{ level: 'fact', id: 'x1', project: 'dsh', content: 'x', score: 0.01, explain: { bm25: 0.004, importance: 3, recencyWeight: 0.875, status: 'active' } }] }).map((x) => x.text)
+  check('search render keeps small explain values (#79)', tiny.includes('  bm25=0.004 importance=3 recencyWeight=0.875 status=active score=0.01'), JSON.stringify(tiny))
+  check('search render default has no breakdown (#79)', !searchTool.output.render({}, noE).some((x) => x.text.includes('bm25=')))
   dbE.close()
   rmSync(wsE, { recursive: true, force: true })
 }
