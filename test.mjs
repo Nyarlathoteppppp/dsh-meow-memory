@@ -2505,6 +2505,131 @@ rmSync(wsNoDb, { recursive: true, force: true })
   // connectionAuthOf：属性访问优先，ctx.get 回退
   check('connectionAuthOf: property access (#57)', connectionAuthOf({ connection: { requestRejection: () => undefined } }) !== undefined)
   check('connectionAuthOf: ctx.get fallback (#57)', connectionAuthOf({ get: (n) => (n === 'connection' ? { requestRejection: () => 403 } : undefined) }) !== undefined)
+
+  // #78：webServer 先就绪，连接服务晚到；同一组路由必须现取鉴权，不永久 503。
+  for (const lookup of ['property', 'get']) {
+    const tmp = mkdtempSync(join(tmpdir(), 'mm-auth-late-'))
+    const savedHome = activeHomeDir()
+    const savedDshHome = process.env.DSH_HOME
+    const savedLang = getPromptLang()
+    const { ctx: routeCtx, handlers: routeHandlers } = makeCtx()
+    const routes = new Map()
+    let registrations = 0
+    let routeDisposals = 0
+    let currentConnection
+    let listCalls = 0
+    const authCalls = []
+    const webServer = {
+      register(route) {
+        registrations++
+        routes.set(route.path, route)
+        return () => { routeDisposals++; routes.delete(route.path) }
+      },
+    }
+    const commands = { register: () => () => {} }
+    const sessionPersistence = { list: async () => { listCalls++; return [] } }
+    Object.defineProperty(routeCtx, 'connection', {
+      get() {
+        // #78：另一种宿主属性访问会抛错，仍须通过 ctx.get 动态恢复。
+        if (lookup === 'get') throw new Error('connection property unavailable')
+        return currentConnection
+      },
+    })
+    routeCtx.get = (name) => {
+      if (name === 'webServer') return webServer
+      if (name === 'commands') return commands
+      if (name === 'sessionPersistence') return sessionPersistence
+      if (name === 'connection' && lookup === 'get') return currentConnection
+      return undefined
+    }
+    routeCtx.effect = (fn) => fn()
+    const makeConnection = (rejection) => ({
+      rejection,
+      requestRejection(req) {
+        authCalls.push({ receiver: this, req })
+        return this.rejection
+      },
+    })
+    // #78：loopback 会通过旧版 fence；现代服务的 401/403 仍必须优先。
+    const req = { method: 'GET', headers: { host: '127.0.0.1:19387' } }
+    const postReq = {
+      ...req,
+      method: 'POST',
+      on() { throw new Error('rejected POST must not read its body') },
+    }
+    const cases = [
+      ['/meow-memory/dreamed-sessions', req],
+      ['/meow-memory/dream-events', req],
+      ['/meow-memory/skip-dreams', req],
+      ['/meow-memory/skip-dreams', postReq],
+    ]
+    const invoke = async (path, request) => {
+      const res = makeRes()
+      routes.get(path)?.handler(request, res)
+      // #78：snapshot 内部为异步 IIFE；让空 list() 的微任务完成再断言。
+      await new Promise((resolve) => setImmediate(resolve))
+      return res
+    }
+    const expectRejected = async (code, body) => {
+      for (const [path, request] of cases) {
+        const res = await invoke(path, request)
+        check(`routes late connection (${lookup}): ${request.method} ${path} → ${code} (#78)`,
+          res.statusCode === code && res.bodyText === body,
+          JSON.stringify({ status: res.statusCode, body: res.bodyText }))
+      }
+    }
+    try {
+      // #78：隔离 apply 的全局目录、宿主目录与迁移，绝不搬动真实用户数据。
+      process.env.DSH_HOME = join(tmp, 'dsh-home')
+      setActiveHomeDir(tmp)
+      writeFileSync(join(tmp, 'migrate-v0-state.json'), JSON.stringify({ migrated: true }))
+      await apply(routeCtx, {
+        enabled: true,
+        homeDir: tmp,
+        projectDir: '.dsh-meow',
+        promptLang: 'zh',
+        dream: { enabled: false },
+      })
+      check(`routes late connection (${lookup}): registered while unavailable (#78)`,
+        registrations === 3 && routes.size === 3 && cases.every(([path]) => routes.has(path)))
+      await expectRejected(503, 'meow-memory: authentication service unavailable')
+
+      currentConnection = makeConnection(401)
+      await expectRejected(401, 'unauthorized')
+      check(`routes late connection (${lookup}): modern receiver and request preserved (#78)`,
+        authCalls.length === 4 && authCalls.every((call, i) =>
+          call.receiver === currentConnection && call.req === cases[i][1]))
+
+      // #78：替换整个服务对象，不能缓存首次成功取得的连接。
+      authCalls.length = 0
+      currentConnection = makeConnection(403)
+      await expectRejected(403, 'forbidden')
+      check(`routes late connection (${lookup}): replacement service consulted (#78)`,
+        authCalls.length === 4 && authCalls.every((call) => call.receiver === currentConnection))
+      check(`routes late connection (${lookup}): rejected snapshot never reads sessions (#78)`,
+        listCalls === 0)
+
+      currentConnection = makeConnection(undefined)
+      const snapshot = await invoke('/meow-memory/dreamed-sessions', req)
+      check(`routes late connection (${lookup}): authenticated snapshot recovers (#78)`,
+        snapshot.statusCode === 200 &&
+          snapshot.bodyText === JSON.stringify({ sessionIds: [], dreamingIds: [] }) && listCalls === 1,
+        JSON.stringify({ status: snapshot.statusCode, body: snapshot.bodyText, listCalls }))
+
+      currentConnection = undefined
+      await expectRejected(503, 'meow-memory: authentication service unavailable')
+      check(`routes late connection (${lookup}): no re-registration needed (#78)`, registrations === 3)
+    } finally {
+      routeHandlers.dispose?.()
+      setActiveHomeDir(savedHome)
+      setPromptLang(savedLang)
+      if (savedDshHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = savedDshHome
+      rmSync(tmp, { recursive: true, force: true })
+    }
+    check(`routes late connection (${lookup}): routes disposed (#78)`,
+      routeDisposals === 3 && routes.size === 0)
+  }
 }
 
 console.log(`\n${passed} passed, ${failed} failed`)

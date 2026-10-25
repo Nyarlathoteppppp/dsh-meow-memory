@@ -1673,10 +1673,11 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       // #57：动态路由全部过鉴权闸（与官方 /api 同闸）——webServer.register 不经过
       // dsh-client-connection 的鉴权层，裸注册曾跨站可读可写。连接服务整个缺失时
       // 保守 503（鉴权不可用就宁可不可用）。静态资源型路由（本插件无）保持开放。
-      const connection = connectionAuthOf(ctx)
+      // #78：每次请求现取连接服务，避免 webServer 先就绪时把缺失状态永久捕获；
+      // 未就绪仍由鉴权闸拒绝（503），现代宿主绝不降级绕过认证。
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const gated = (handler: (req: any, res: any) => void): ((req: unknown, res: unknown) => void) =>
-        authGate(connection, handler) as (req: unknown, res: unknown) => void
+        (req, res) => (authGate(connectionAuthOf(ctx), handler) as (req: unknown, res: unknown) => void)(req, res)
       const registerOne = (route: { kind: 'exact'; path: string; handler: (req: unknown, res: unknown) => void }): void => {
         try {
           routeDisposers.push(ctx.effect(() => ws.register(route)))
